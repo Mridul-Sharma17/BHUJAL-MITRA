@@ -1,0 +1,1 @@
+"""Bhujal Mitra application package."""
