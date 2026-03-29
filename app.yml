@@ -11,3 +11,17 @@ command:
 env:
   - name: STREAMLIT_BROWSER_GATHER_USAGE_STATS
     value: "false"
+  - name: BHUJAL_FORECAST_RETRIEVAL_MODE
+    value: "local_csv"
+  - name: BHUJAL_ADVISORY_LLM_ENDPOINT
+    value: "databricks-meta-llama-3-1-8b-instruct"
+  - name: BHUJAL_ADVISORY_FALLBACK_ENDPOINT
+    value: "databricks-gemma-3-12b"
+  - name: BHUJAL_TRANSLATION_LLM_ENDPOINT_HINDI
+    value: "databricks-meta-llama-3-1-8b-instruct"
+  - name: BHUJAL_TRANSLATION_LLM_ENDPOINT_MARATHI
+    value: "databricks-gemma-3-12b"
+  - name: BHUJAL_TRANSLATION_FALLBACK_ENDPOINT
+    value: "databricks-gemma-3-12b"
+  - name: BHUJAL_TRANSLATION_QUALITY_FALLBACK_ENDPOINT
+    value: "databricks-qwen3-next-80b-a3b-instruct"

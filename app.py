@@ -1,6 +1,6 @@
 import streamlit as st
 
-from src.agent import get_bhujal_advice_bundle
+from src.agent import get_bhujal_advice_bundle, translate_advice_from_english
 
 
 st.set_page_config(
@@ -22,6 +22,11 @@ with st.sidebar:
 
 st.markdown("### Ask Your Question")
 
+if "last_payload" not in st.session_state:
+    st.session_state["last_payload"] = None
+if "display_language" not in st.session_state:
+    st.session_state["display_language"] = "English"
+
 with st.form("bhujal_advice_form"):
     district_options = [
         "Pune",
@@ -37,9 +42,9 @@ with st.form("bhujal_advice_form"):
 
     response_language = st.selectbox(
         "Response language",
-        options=["English", "Marathi"],
+        options=["English", "Hindi", "Marathi"],
         index=0,
-        help="The advisory will be generated in only the selected language.",
+        help="Choose the language for the advisory response.",
     )
 
     user_query = st.text_input(
@@ -54,55 +59,97 @@ if submitted:
     if not cleaned_query:
         st.warning("Please enter a question before submitting.")
     else:
-        with st.spinner("Generating advice using policy + forecast context..."):
+        with st.spinner("Generating advisory..."):
             try:
                 payload = get_bhujal_advice_bundle(
                     cleaned_query,
                     district,
                     response_language=response_language,
+                    include_all_translations=False,
                 )
             except Exception as exc:
                 st.error("Could not generate advice right now. Please try again in a moment.")
                 st.exception(exc)
             else:
-                left_col, right_col = st.columns([2, 1], gap="large")
+                st.session_state["last_payload"] = payload
+                st.session_state["display_language"] = response_language
 
-                with left_col:
-                    st.markdown(f"### Advisory ({response_language})")
-                    st.markdown(payload.get("advice_text", ""))
+payload = st.session_state.get("last_payload")
+if payload:
+    left_col, right_col = st.columns([2, 1], gap="large")
 
-                with right_col:
-                    st.markdown("### Context Snapshot")
-                    st.caption(f"District: {payload.get('district_name', district)}")
+    with left_col:
+        st.markdown("### Advisory")
+        st.caption("Use the language buttons to switch advisory language.")
 
-                    policy_sources = payload.get("policy_sources") or []
-                    if policy_sources:
-                        st.markdown("**Policy Sources Used**")
-                        st.write("\n".join(f"- {item}" for item in policy_sources))
+        lang_col_1, lang_col_2, lang_col_3 = st.columns(3)
+        if lang_col_1.button("English", key="lang_btn_english", use_container_width=True):
+            st.session_state["display_language"] = "English"
+        if lang_col_2.button("Hindi", key="lang_btn_hindi", use_container_width=True):
+            st.session_state["display_language"] = "Hindi"
+        if lang_col_3.button("Marathi", key="lang_btn_marathi", use_container_width=True):
+            st.session_state["display_language"] = "Marathi"
+
+        advice_variants = payload.get("advice_variants") or {"English": payload.get("advice_text", "")}
+        display_language = st.session_state.get("display_language", "English")
+        if "English" not in advice_variants:
+            advice_variants["English"] = payload.get("english_advice_text", payload.get("advice_text", ""))
+
+        if display_language not in advice_variants and display_language in {"Hindi", "Marathi"}:
+            english_source = advice_variants.get("English", "")
+            if english_source:
+                with st.spinner(f"Preparing advisory in {display_language}..."):
+                    try:
+                        translated_text = translate_advice_from_english(english_source, display_language)
+                    except Exception as exc:
+                        st.warning(f"Could not translate to {display_language} right now. Showing English instead.")
+                        st.caption(str(exc))
+                        display_language = "English"
+                        st.session_state["display_language"] = "English"
                     else:
-                        st.info("No policy chunks were retrieved for this query.")
+                        advice_variants[display_language] = translated_text
+                        payload["advice_variants"] = advice_variants
+                        st.session_state["last_payload"] = payload
 
-                    forecast_rows = payload.get("forecast_rows") or []
-                    forecast_meta = payload.get("forecast_metadata") or {}
+        if display_language not in advice_variants:
+            display_language = "English"
+            st.session_state["display_language"] = "English"
 
-                    st.markdown("**Forecast Coverage**")
-                    st.write(f"Rows returned: {len(forecast_rows)}")
-                    if forecast_meta.get("date_column"):
-                        st.write(f"Date column: {forecast_meta['date_column']}")
-                    if forecast_meta.get("prediction_columns"):
-                        st.write(
-                            "Prediction columns: "
-                            + ", ".join(str(col) for col in forecast_meta["prediction_columns"])
-                        )
-                    if forecast_meta.get("note"):
-                        st.caption(f"Note: {forecast_meta['note']}")
+        st.markdown(f"#### Advisory ({display_language})")
+        st.markdown(advice_variants.get(display_language, payload.get("advice_text", "")))
 
-                    if forecast_rows:
-                        st.markdown("**Forecast Preview (top 7 rows)**")
-                        st.dataframe(forecast_rows[:7], use_container_width=True)
+    with right_col:
+        st.markdown("### Context Snapshot")
+        st.caption(f"District: {payload.get('district_name', district)}")
 
-                    diagnostics = payload.get("diagnostics") or []
-                    if diagnostics:
-                        st.markdown("**Diagnostics**")
-                        for item in diagnostics:
-                            st.caption(f"- {item}")
+        policy_sources = payload.get("policy_sources") or []
+        if policy_sources:
+            st.markdown("**Policy Sources Used**")
+            st.write("\n".join(f"- {item}" for item in policy_sources))
+        else:
+            st.info("No policy chunks were retrieved for this query.")
+
+        forecast_rows = payload.get("forecast_rows") or []
+        forecast_meta = payload.get("forecast_metadata") or {}
+
+        st.markdown("**Forecast Coverage**")
+        st.write(f"Rows returned: {len(forecast_rows)}")
+        if forecast_meta.get("date_column"):
+            st.write(f"Date column: {forecast_meta['date_column']}")
+        if forecast_meta.get("prediction_columns"):
+            st.write(
+                "Prediction columns: "
+                + ", ".join(str(col) for col in forecast_meta["prediction_columns"])
+            )
+        if forecast_meta.get("note"):
+            st.caption(f"Note: {forecast_meta['note']}")
+
+        if forecast_rows:
+            st.markdown("**Forecast Preview (top 7 rows)**")
+            st.dataframe(forecast_rows[:7], use_container_width=True)
+
+        diagnostics = payload.get("diagnostics") or []
+        if diagnostics:
+            st.markdown("**Diagnostics**")
+            for item in diagnostics:
+                st.caption(f"- {item}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import os
 import re
+from collections import Counter
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
@@ -38,9 +39,34 @@ VECTOR_INDEX_NAME = os.getenv(
 FORECAST_TABLE = os.getenv(
     "BHUJAL_FORECAST_TABLE", f"{CATALOG}.{SCHEMA}.groundwater_prediction_gold"
 )
-LLM_ENDPOINT_NAME = os.getenv(
-    "BHUJAL_LLM_ENDPOINT", "databricks-qwen3-next-80b-a3b-instruct"
+ADVISORY_LLM_ENDPOINT_NAME = os.getenv(
+    "BHUJAL_ADVISORY_LLM_ENDPOINT",
+    os.getenv("BHUJAL_LLM_ENDPOINT", "databricks-meta-llama-3-1-8b-instruct"),
 )
+ADVISORY_FALLBACK_ENDPOINT_NAME = os.getenv(
+    "BHUJAL_ADVISORY_FALLBACK_ENDPOINT",
+    "databricks-gemma-3-12b",
+)
+TRANSLATION_LLM_ENDPOINT_HINDI = os.getenv(
+    "BHUJAL_TRANSLATION_LLM_ENDPOINT_HINDI",
+    os.getenv("BHUJAL_TRANSLATION_LLM_ENDPOINT", "databricks-meta-llama-3-1-8b-instruct"),
+)
+TRANSLATION_LLM_ENDPOINT_MARATHI = os.getenv(
+    "BHUJAL_TRANSLATION_LLM_ENDPOINT_MARATHI",
+    "databricks-gemma-3-12b",
+)
+TRANSLATION_LLM_ENDPOINT_DEFAULT = os.getenv(
+    "BHUJAL_TRANSLATION_LLM_ENDPOINT_DEFAULT",
+    "databricks-meta-llama-3-1-8b-instruct",
+)
+TRANSLATION_FALLBACK_ENDPOINT_NAME = os.getenv(
+    "BHUJAL_TRANSLATION_FALLBACK_ENDPOINT", "databricks-gemma-3-12b"
+)
+TRANSLATION_QUALITY_FALLBACK_ENDPOINT_NAME = os.getenv(
+    "BHUJAL_TRANSLATION_QUALITY_FALLBACK_ENDPOINT",
+    "databricks-qwen3-next-80b-a3b-instruct",
+)
+FORECAST_RETRIEVAL_MODE = os.getenv("BHUJAL_FORECAST_RETRIEVAL_MODE", "auto").strip().lower()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_FORECAST_CSV = Path(
     os.getenv("BHUJAL_LOCAL_FORECAST_CSV", str(PROJECT_ROOT / "data" / "Maharashtra_Pune_Filtered.csv"))
@@ -97,6 +123,53 @@ Output format requirements:
 8. Include specific quantities or schedules wherever possible (for example timing, frequency, rough amounts).
 9. Do not include a second-language section or mixed-language output.
 10. Be comprehensive; do not shorten the response to save tokens.
+11. Each time window must include at least 3 numbered steps.
+12. Each numbered step must include three explicit sub-lines: What to do, How to do, Why it helps.
+13. Make the answer district-specific; do not give generic advice that could apply to any district.
+14. Start with a short "District Situation" section that analyzes groundwater/rainfall trends using the provided forecast rows.
+15. Add a "Policy Evidence" section with at least 3 concrete evidence bullets, each tied to a source and a specific example from context.
+16. For every numbered action, include an evidence line that references policy and/or forecast evidence used for that step.
+17. If district-specific policy chunks are missing, state that clearly and use Maharashtra-level evidence explicitly.
+18. Never invent source names, dates, numeric values, talukas, or historical claims that are not in the provided context.
+19. Avoid vague lines like "contact authorities" unless you explain what support is expected and why it matches district evidence.
+20. Keep source names exactly as provided in context.
+21. Use this exact section order:
+    - District Situation
+    - Policy Evidence (label bullets as P1, P2, P3...)
+    - Forecast Evidence (label bullets as F1, F2, F3...)
+    - First 24 Hours Plan
+    - Next 7 Days Plan
+    - Next 30 Days Plan
+22. For each numbered action, add one extra line: Evidence used: [policy tags and/or forecast tags].
+23. In Policy Evidence bullets, include the exact source filename and one short quoted phrase copied from the provided excerpt text.
+24. In Forecast Evidence bullets, include date + metric name + numeric value exactly from context rows.
+25. All recommendations must be agriculture and groundwater specific for farmers; do not include household or urban advice.
+26. Every action must mention a district-grounded reason (for example low groundwater levels, weak rainfall pattern, recharge priority in district studies).
+""".strip()
+
+TRANSLATION_SYSTEM_PROMPT_TEMPLATE = """
+You are an expert agricultural translator for Maharashtra farmers.
+Translate the provided advisory into {target_language} while preserving all practical details.
+
+Strict translation requirements:
+1. Keep the same structure, section order, and numbered step order.
+2. Do not omit, shorten, or summarize any step.
+3. Preserve all numbers, quantities, dates, units, and schedules exactly.
+4. Keep every policy reference and forecast reference intact.
+5. Use simple {target_language} suitable for farmers.
+6. Output only {target_language} text.
+""".strip()
+
+TRANSLATION_REPAIR_PROMPT_TEMPLATE = """
+You are fixing a translation that became too short.
+Rewrite the advisory in {target_language} so it preserves all details from the source advisory.
+
+Strict repair requirements:
+1. Keep all sections and numbered steps from the source.
+2. Do not omit any instruction, quantity, date, unit, policy reference, or forecast value.
+3. Use simple {target_language} for farmers.
+4. Expand any shortened steps so the {target_language} version has similar depth to the source text.
+5. Output only {target_language} text.
 """.strip()
 
 USER_PROMPT_TEMPLATE = """
@@ -123,11 +196,26 @@ Response language:
 
 User preference for writing style:
 Detailed, step-by-step, easy for farmers, and not generic.
+
+Strict relevance instructions:
+- Use district-specific details from the provided policy and forecast context.
+- Include concrete examples from policy context (for example practice names, outcomes, or observed district patterns from excerpts).
+- Include groundwater analysis from forecast values (for example low/high values, direction of change, and risk implication).
+- Explicitly connect each recommendation to the cited policy/forecast evidence.
+- If required evidence is unavailable, say what is missing and then provide the safest practical alternative.
+- Avoid generic advice that is not directly actionable on farms.
 """.strip()
 
 SUPPORTED_RESPONSE_LANGUAGES = {
     "english": "English",
+    "hindi": "Hindi",
     "marathi": "Marathi",
+}
+
+SUPPORTED_RESPONSE_LANGUAGE_ALIASES = {
+    "en": "english",
+    "hi": "hindi",
+    "mr": "marathi",
 }
 
 DISTRICT_PROFILE_NOTES = {
@@ -144,6 +232,15 @@ DISTRICT_PROFILE_NOTES = {
         "prioritize conservation and recharge-focused actions."
     ),
 }
+
+DISTRICT_SOURCE_KEYWORDS = {
+    "pune": ("pune", "maharashtra"),
+    "nashik": ("nashik", "maharashtra"),
+    "ahmednagar": ("ahmednagar", "maharashtra"),
+}
+
+_MISSING_TRANSLATION_ENDPOINTS: set[str] = set()
+_UNAVAILABLE_ADVISORY_ENDPOINTS: set[str] = set()
 
 
 def _normalize(name: str) -> str:
@@ -322,14 +419,22 @@ def _extract_excerpt_for_terms(text: str, terms: Sequence[str], max_len: int = 5
     return clean_text[start:end]
 
 
-def _retrieve_policy_chunks_local_files(user_query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+def _retrieve_policy_chunks_local_files(
+    user_query: str,
+    district_name: str,
+    top_k: int = 3,
+) -> List[Dict[str, Any]]:
     docs = _load_local_policy_documents()
     if not docs:
         return []
 
+    district_key = (district_name or "").strip().lower()
     terms = [tok.lower() for tok in re.findall(r"\w+", user_query or "") if len(tok) >= 2]
     scored_docs: List[Tuple[int, Dict[str, str]]] = []
     for doc in docs:
+        if not _is_policy_source_allowed_for_district(doc.get("source_name", ""), district_name):
+            continue
+
         text_lower = doc["text"].lower()
         score = 0
         for term in terms[:40]:
@@ -338,7 +443,12 @@ def _retrieve_policy_chunks_local_files(user_query: str, top_k: int = 3) -> List
             # Keep policy retrieval robust for mixed-language queries.
             if any(token in text_lower for token in ("groundwater", "irrigation", "water", "recharge", "crop")):
                 score = 1
+        if district_key and district_key in doc.get("source_name", "").lower():
+            score += 100
         scored_docs.append((score, doc))
+
+    if not scored_docs:
+        return []
 
     scored_docs.sort(key=lambda item: item[0], reverse=True)
     output: List[Dict[str, Any]] = []
@@ -457,6 +567,7 @@ def _retrieve_forecast_rows_local_csv(
 
 def _resolve_response_language(response_language: str) -> str:
     requested = (response_language or "").strip().lower()
+    requested = SUPPORTED_RESPONSE_LANGUAGE_ALIASES.get(requested, requested)
     if requested in SUPPORTED_RESPONSE_LANGUAGES:
         return SUPPORTED_RESPONSE_LANGUAGES[requested]
     if not requested:
@@ -471,6 +582,92 @@ def _resolve_district_profile_note(district_name: str) -> str:
         district_key,
         "No district-specific profile note found. Use available policy and forecast context carefully.",
     )
+
+
+def _is_policy_source_allowed_for_district(source_name: str, district_name: str) -> bool:
+    source = (source_name or "").strip().lower()
+    if not source:
+        return False
+    if source.endswith(".txt") or source == "maharashtra_water_policy.txt":
+        return False
+
+    district_key = (district_name or "").strip().lower()
+    allowed_tokens = DISTRICT_SOURCE_KEYWORDS.get(district_key)
+    if not allowed_tokens:
+        return True
+    return any(token in source for token in allowed_tokens)
+
+
+def _is_databricks_app_runtime() -> bool:
+    app_runtime_env_vars = [
+        "DATABRICKS_APP_NAME",
+        "DATABRICKS_APP_ID",
+        "DATABRICKS_APP_DEPLOYMENT_ID",
+    ]
+    return any(bool(os.getenv(var_name)) for var_name in app_runtime_env_vars)
+
+
+def _resolve_forecast_retrieval_mode() -> str:
+    mode = (FORECAST_RETRIEVAL_MODE or "auto").strip().lower()
+    if mode not in {"auto", "spark", "local_csv"}:
+        mode = "auto"
+
+    if mode == "auto" and _is_databricks_app_runtime():
+        return "local_csv"
+    return mode
+
+
+def _count_numbered_steps(text: str) -> int:
+    return len(re.findall(r"(?m)^\s*\d+[.)]\s+", text or ""))
+
+
+def _has_excessive_repetition(text: str) -> bool:
+    normalized = " ".join((text or "").split())
+    if not normalized:
+        return False
+
+    # Detect repeating multi-word phrase loops.
+    repeating_phrase_pattern = r"((?:\S+\s+){2,12}\S+)(?:\s+\1){3,}"
+    if re.search(repeating_phrase_pattern, normalized, flags=re.IGNORECASE):
+        return True
+
+    words = re.findall(r"\w+", normalized, flags=re.UNICODE)
+    if len(words) >= 80:
+        repeated_adjacent = sum(1 for idx in range(1, len(words)) if words[idx] == words[idx - 1])
+        if repeated_adjacent / max(len(words), 1) > 0.06:
+            return True
+
+        line_counts = Counter(line.strip() for line in (text or "").splitlines() if line.strip())
+        if line_counts and max(line_counts.values()) >= 4:
+            return True
+
+    return False
+
+
+def _translation_quality_failed(source_text: str, translated_text: str) -> bool:
+    source = (source_text or "").strip()
+    translated = (translated_text or "").strip()
+
+    if not translated:
+        return True
+
+    if source and source == translated:
+        return True
+
+    if _has_excessive_repetition(translated):
+        return True
+
+    source_len = len(source)
+    translated_len = len(translated)
+    if source_len >= 1200 and translated_len < int(source_len * 0.55):
+        return True
+
+    source_steps = _count_numbered_steps(source)
+    translated_steps = _count_numbered_steps(translated)
+    if source_steps >= 6 and translated_steps < max(3, int(source_steps * 0.55)):
+        return True
+
+    return False
 
 
 def _parse_similarity_response(response: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -500,19 +697,28 @@ def _parse_similarity_response(response: Dict[str, Any]) -> List[Dict[str, Any]]
     return parsed_rows
 
 
-def _retrieve_policy_chunks(user_query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+def _retrieve_policy_chunks(
+    user_query: str,
+    district_name: str,
+    top_k: int = 3,
+) -> List[Dict[str, Any]]:
     fetch_k = max(top_k * 4, 12)
+    district_key = (district_name or "").strip().lower()
 
     def _filter_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        filtered: List[Dict[str, Any]] = []
+        district_rows: List[Dict[str, Any]] = []
+        state_rows: List[Dict[str, Any]] = []
         for row in rows:
             source_name = str(row.get("source_name") or row.get("path") or "").strip().lower()
-            if source_name.endswith(".txt") or source_name == "maharashtra_water_policy.txt":
+            if not _is_policy_source_allowed_for_district(source_name, district_name):
                 continue
-            filtered.append(row)
-            if len(filtered) >= top_k:
-                break
-        return filtered
+            if district_key and district_key in source_name:
+                district_rows.append(row)
+            else:
+                state_rows.append(row)
+
+        ordered_rows = district_rows + state_rows
+        return ordered_rows[:top_k]
 
     candidate_column_sets = [
         ["chunk_id", "source_name", "chunk_text", "path", "chunk_index"],
@@ -558,7 +764,11 @@ def _retrieve_policy_chunks(user_query: str, top_k: int = 3) -> List[Dict[str, A
     except Exception as exc:  # pragma: no cover - service exceptions vary by runtime
         last_error = exc
 
-    local_rows = _retrieve_policy_chunks_local_files(user_query, top_k=top_k)
+    local_rows = _retrieve_policy_chunks_local_files(
+        user_query=user_query,
+        district_name=district_name,
+        top_k=top_k,
+    )
     if local_rows:
         return local_rows
 
@@ -652,6 +862,15 @@ def _retrieve_forecast_rows(
     district_name: str,
     horizon_days: int = 30,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    retrieval_mode = _resolve_forecast_retrieval_mode()
+
+    if retrieval_mode == "local_csv":
+        return _retrieve_forecast_rows_local_csv(
+            district_name=district_name,
+            horizon_days=horizon_days,
+            fallback_reason="Configured local CSV forecast mode for this runtime.",
+        )
+
     try:
         spark = _get_spark()
         df = spark.table(FORECAST_TABLE)
@@ -851,6 +1070,44 @@ def _build_databricks_messages(
     ]
 
 
+def _build_translation_messages(
+    source_text: str,
+    target_language: str,
+) -> List[ChatMessage]:
+    system_prompt = TRANSLATION_SYSTEM_PROMPT_TEMPLATE.format(target_language=target_language)
+    user_prompt = (
+        f"Target language: {target_language}\n\n"
+        "Translate the following advisory while preserving every detail:\n\n"
+        f"{source_text}"
+    )
+    return [
+        ChatMessage(role=ChatMessageRole.SYSTEM, content=system_prompt),
+        ChatMessage(role=ChatMessageRole.USER, content=user_prompt),
+    ]
+
+
+def _build_translation_repair_messages(
+    source_text: str,
+    translated_text: str,
+    target_language: str,
+    min_chars: int,
+) -> List[ChatMessage]:
+    system_prompt = TRANSLATION_REPAIR_PROMPT_TEMPLATE.format(target_language=target_language)
+    user_prompt = (
+        f"Target language: {target_language}\n\n"
+        f"Minimum output length target: {min_chars} characters\n\n"
+        "Source advisory:\n"
+        f"{source_text}\n\n"
+        "Current translation (too short):\n"
+        f"{translated_text}\n\n"
+        f"Rewrite the {target_language} translation with full detail parity."
+    )
+    return [
+        ChatMessage(role=ChatMessageRole.SYSTEM, content=system_prompt),
+        ChatMessage(role=ChatMessageRole.USER, content=user_prompt),
+    ]
+
+
 def _extract_llm_text(response: QueryEndpointResponse) -> str:
     if response.choices:
         for choice in response.choices:
@@ -878,24 +1135,189 @@ def _extract_llm_text(response: QueryEndpointResponse) -> str:
     return ""
 
 
-def _query_llm(messages: List[ChatMessage]) -> str:
+def _query_llm(
+    messages: List[ChatMessage],
+    temperature: float = 0.15,
+    max_tokens: int = 1800,
+    endpoint_name: Optional[str] = None,
+) -> str:
+    endpoint = (endpoint_name or ADVISORY_LLM_ENDPOINT_NAME).strip()
     workspace_client = WorkspaceClient()
     response = workspace_client.serving_endpoints.query(
-        name=LLM_ENDPOINT_NAME,
+        name=endpoint,
         messages=messages,
-        temperature=0.15,
-        max_tokens=1800,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
     answer = _extract_llm_text(response)
     if not answer:
-        raise RuntimeError("LLM endpoint returned an empty response payload.")
+        raise RuntimeError(f"LLM endpoint '{endpoint}' returned an empty response payload.")
     return answer
+
+
+def _is_endpoint_unavailable_error(exc: Exception) -> bool:
+    error_text = str(exc).lower()
+    return any(
+        token in error_text
+        for token in [
+            "endpoint does not exist",
+            "endpoint not found",
+            "resource does not exist",
+            "not found",
+            "no such",
+            "temporarily disabled due to a databricks-set rate limit of 0",
+            "temporarily disabled due a databricks-set rate limit of 0",
+        ]
+    )
+
+
+def _query_advisory_llm(
+    messages: List[ChatMessage],
+    temperature: float,
+    max_tokens: int,
+) -> str:
+    endpoints: List[str] = []
+    for endpoint in [ADVISORY_LLM_ENDPOINT_NAME, ADVISORY_FALLBACK_ENDPOINT_NAME]:
+        clean_endpoint = (endpoint or "").strip()
+        if clean_endpoint and clean_endpoint not in endpoints:
+            endpoints.append(clean_endpoint)
+
+    last_error: Optional[Exception] = None
+    for endpoint in endpoints:
+        if endpoint in _UNAVAILABLE_ADVISORY_ENDPOINTS:
+            continue
+
+        try:
+            return _query_llm(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                endpoint_name=endpoint,
+            )
+        except Exception as exc:  # pragma: no cover - endpoint errors vary by runtime
+            last_error = exc
+            if _is_endpoint_unavailable_error(exc):
+                _UNAVAILABLE_ADVISORY_ENDPOINTS.add(endpoint)
+
+    if last_error:
+        raise RuntimeError(f"Advisory endpoint query failed: {last_error}") from last_error
+    raise RuntimeError("No advisory endpoint is configured.")
+
+
+def _translation_primary_endpoint(target_language: str) -> str:
+    language = _resolve_response_language(target_language)
+    if language == "Marathi":
+        return TRANSLATION_LLM_ENDPOINT_MARATHI
+    if language == "Hindi":
+        return TRANSLATION_LLM_ENDPOINT_HINDI
+    return TRANSLATION_LLM_ENDPOINT_DEFAULT
+
+
+def _query_translation_llm(
+    messages: List[ChatMessage],
+    temperature: float,
+    max_tokens: int,
+    target_language: str,
+    use_quality_fallback: bool = False,
+) -> str:
+    endpoints: List[str] = []
+
+    quality_endpoint = TRANSLATION_QUALITY_FALLBACK_ENDPOINT_NAME if use_quality_fallback else ""
+    for endpoint in [
+        quality_endpoint,
+        _translation_primary_endpoint(target_language),
+        TRANSLATION_LLM_ENDPOINT_DEFAULT,
+        TRANSLATION_FALLBACK_ENDPOINT_NAME,
+        ADVISORY_LLM_ENDPOINT_NAME,
+    ]:
+        clean_endpoint = (endpoint or "").strip()
+        if clean_endpoint and clean_endpoint not in endpoints:
+            endpoints.append(clean_endpoint)
+
+    last_error: Optional[Exception] = None
+    for endpoint in endpoints:
+        if endpoint in _MISSING_TRANSLATION_ENDPOINTS:
+            continue
+
+        try:
+            return _query_llm(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                endpoint_name=endpoint,
+            )
+        except Exception as exc:  # pragma: no cover - endpoint errors vary by runtime
+            last_error = exc
+            if _is_endpoint_unavailable_error(exc):
+                _MISSING_TRANSLATION_ENDPOINTS.add(endpoint)
+
+    if last_error:
+        raise RuntimeError(f"Translation endpoint query failed: {last_error}") from last_error
+    raise RuntimeError("No translation endpoint is configured.")
+
+
+def _translate_with_repair(source_text: str, target_language: str) -> str:
+    translated_answer = _query_translation_llm(
+        _build_translation_messages(source_text=source_text, target_language=target_language),
+        temperature=0.1,
+        max_tokens=2300,
+        target_language=target_language,
+    )
+
+    # Repair only when quality clearly fails (for example severe shortening or structural loss).
+    if _translation_quality_failed(source_text, translated_answer):
+        min_chars = int(len(source_text) * 0.75)
+        translated_answer = _query_translation_llm(
+            _build_translation_repair_messages(
+                source_text=source_text,
+                translated_text=translated_answer,
+                target_language=target_language,
+                min_chars=min_chars,
+            ),
+            temperature=0.1,
+            max_tokens=2600,
+            target_language=target_language,
+        )
+
+        # If translation is still low quality (for example repetitive loops), retry once with quality fallback.
+        if _translation_quality_failed(source_text, translated_answer):
+            translated_answer = _query_translation_llm(
+                _build_translation_messages(source_text=source_text, target_language=target_language),
+                temperature=0.1,
+                max_tokens=2600,
+                target_language=target_language,
+                use_quality_fallback=True,
+            )
+
+            if _translation_quality_failed(source_text, translated_answer):
+                raise RuntimeError(
+                    f"{target_language} translation quality check failed after retry with fallback model."
+                )
+
+    return translated_answer
+
+
+def translate_advice_from_english(source_text: str, target_language: str) -> str:
+    language = _resolve_response_language(target_language)
+    normalized_source = (source_text or "").strip()
+
+    if not normalized_source:
+        raise ValueError("source_text cannot be empty.")
+
+    if language == "English":
+        return normalized_source
+
+    return _translate_with_repair(
+        source_text=normalized_source,
+        target_language=language,
+    )
 
 
 def get_bhujal_advice_bundle(
     user_query: str,
     district_name: str,
     response_language: str = "English",
+    include_all_translations: bool = False,
 ) -> Dict[str, Any]:
     query = (user_query or "").strip()
     district = (district_name or "").strip()
@@ -909,7 +1331,7 @@ def get_bhujal_advice_bundle(
     diagnostics: List[str] = []
 
     try:
-        policy_rows = _retrieve_policy_chunks(query, top_k=3)
+        policy_rows = _retrieve_policy_chunks(query, district_name=district, top_k=3)
     except Exception as exc:  # pragma: no cover - service exceptions vary by runtime
         policy_rows = []
         diagnostics.append(f"Policy retrieval warning: {exc}")
@@ -932,9 +1354,35 @@ def get_bhujal_advice_bundle(
         policy_context=policy_context,
         forecast_context=forecast_context,
         diagnostics=diagnostics_text,
-        response_language=language,
+        response_language="English",
     )
-    answer = _query_llm(messages)
+    english_answer = _query_advisory_llm(
+        messages,
+        temperature=0.12,
+        max_tokens=2400,
+    )
+
+    advice_variants: Dict[str, str] = {"English": english_answer}
+
+    if include_all_translations:
+        target_languages = ["Hindi", "Marathi"]
+    elif language != "English":
+        target_languages = [language]
+    else:
+        target_languages = []
+
+    for target_language in target_languages:
+        if target_language in advice_variants:
+            continue
+        try:
+            advice_variants[target_language] = translate_advice_from_english(
+                source_text=english_answer,
+                target_language=target_language,
+            )
+        except Exception as exc:  # pragma: no cover - service exceptions vary by runtime
+            diagnostics.append(f"{target_language} translation warning: {exc}")
+
+    answer = advice_variants.get(language, english_answer)
 
     policy_sources = []
     for row in policy_rows:
@@ -944,6 +1392,8 @@ def get_bhujal_advice_bundle(
 
     return {
         "advice_text": answer,
+        "english_advice_text": english_answer,
+        "advice_variants": advice_variants,
         "district_name": district,
         "response_language": language,
         "policy_sources": policy_sources,
@@ -972,7 +1422,11 @@ def get_bhujal_advice(
     return str(payload.get("advice_text", "")).strip()
 
 
-__all__ = ["get_bhujal_advice", "get_bhujal_advice_bundle"]
+__all__ = [
+    "get_bhujal_advice",
+    "get_bhujal_advice_bundle",
+    "translate_advice_from_english",
+]
 
 
 if __name__ == "__main__":
